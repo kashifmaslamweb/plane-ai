@@ -397,56 +397,53 @@ class WorkspaceAITaskReportEndpoint(BaseAPIView):
 
         issue_qs = issue_qs.order_by("-completed_at")[:200]
 
-        # --- Serialize issues — include description content so the AI can read
-        #     blog URLs, notes, links, and any text the team put in the task body ---
+        # --- Serialize issues into a minimal token-efficient format ---
+        # Field names are abbreviated; empty/default values are omitted entirely.
+        # Description is stripped of excess whitespace and capped at 400 chars —
+        # enough for URLs and key content without blowing token budgets.
+        import re as _re
+
         issues_data = []
         for issue in issue_qs:
-            assignee_names = [a.display_name or a.email for a in issue.assignees.all()]
-            label_names = [label.name for label in issue.labels.all()]
+            assignees = [a.display_name or a.email for a in issue.assignees.all()]
+            labels = [lb.name for lb in issue.labels.all()]
 
-            # description_stripped is plain-text (HTML tags removed). Truncate to
-            # 1000 chars per issue so the prompt doesn't exceed token limits.
-            body = (issue.description_stripped or "").strip()
-            if len(body) > 1000:
-                body = body[:1000] + "…"
+            body = _re.sub(r"\s+", " ", (issue.description_stripped or "")).strip()
+            if len(body) > 400:
+                body = body[:400] + "…"
 
-            entry: Dict = {
-                "id": str(issue.sequence_id),
-                "title": issue.name,
-                "project": issue.project.name if issue.project else "Unknown",
-                "priority": issue.priority or "none",
-                "assignees": assignee_names,
-                "labels": label_names,
-                "completed_at": (
-                    issue.completed_at.strftime("%Y-%m-%d %H:%M UTC")
-                    if issue.completed_at
-                    else None
-                ),
-            }
+            # Short keys + omit falsy/default values to minimise token count
+            entry: Dict = {"t": issue.name}
+            if issue.project:
+                entry["p"] = issue.project.name
+            priority = issue.priority or "none"
+            if priority != "none":
+                entry["pr"] = priority
+            if assignees:
+                entry["a"] = assignees
+            if labels:
+                entry["l"] = labels
+            if issue.completed_at:
+                entry["d"] = issue.completed_at.strftime("%Y-%m-%d")
             if body:
-                entry["description"] = body
+                entry["desc"] = body
 
             issues_data.append(entry)
 
-        issues_json = json.dumps(issues_data, ensure_ascii=False, indent=2)
+        # No indent, minimal separators — largest single token saving
+        issues_json = json.dumps(issues_data, ensure_ascii=False, separators=(",", ":"))
 
         system_prompt = (
-            "You are an AI assistant integrated into Plane, a project management tool.\n"
-            "Your job is to analyze completed work items and generate clear, helpful reports.\n"
-            "Each work item may have a 'description' field containing the full task body — "
-            "this often includes URLs, blog links, notes, deliverables, and references.\n"
-            "When the user asks for URLs or links, extract them directly from the description fields.\n"
-            "Use markdown formatting — headings, bullet lists, bold text, tables where appropriate.\n"
-            "Be concise but thorough. Group items logically by project, priority, label, or date as needed.\n"
-            "If there are no matching items, say so clearly and suggest adjusting the date range."
+            "Plane project-management AI. Analyse completed work items and answer the user's question "
+            "using markdown (bullets, bold, tables). Each item: t=title p=project pr=priority "
+            "a=assignees l=labels d=date desc=body. "
+            "Pull URLs/links from desc when asked. If no items match, say so."
         )
 
         user_prompt = (
-            f"User's question: \"{question}\"\n\n"
-            f"Date range searched: {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}\n\n"
-            f"Completed work items (JSON):\n{issues_json}\n\n"
-            "Generate a well-formatted report answering the user's question. "
-            "Extract URLs and specific content from task descriptions where relevant."
+            f"Q: {question}\n"
+            f"Range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n"
+            f"Items: {issues_json}"
         )
 
         text, error = get_llm_response(system_prompt, user_prompt, api_key, model, provider)
