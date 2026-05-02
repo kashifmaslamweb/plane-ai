@@ -6,7 +6,7 @@
 import os
 import json
 from datetime import datetime, timedelta, timezone as dt_timezone
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 # Third party import
 from openai import OpenAI
@@ -20,7 +20,7 @@ from rest_framework.response import Response
 # Module import
 from plane.app.permissions import ROLE, allow_permission
 from plane.app.serializers import ProjectLiteSerializer, WorkspaceLiteSerializer
-from plane.db.models import Issue, Label, Project, Workspace
+from plane.db.models import Issue, Project, Workspace
 from plane.license.utils.instance_value import get_configuration_value
 from plane.utils.exception_logger import log_exception
 
@@ -33,9 +33,10 @@ class LLMProvider:
     name: str = ""
     models: List[str] = []
     default_model: str = ""
+    base_url: Optional[str] = None  # None means use provider SDK default
 
     @classmethod
-    def get_config(cls) -> Dict[str, str | List[str]]:
+    def get_config(cls) -> Dict:
         return {
             "name": cls.name,
             "models": cls.models,
@@ -70,36 +71,67 @@ class GeminiProvider(LLMProvider):
     default_model = "gemini-pro"
 
 
+class OpenRouterProvider(LLMProvider):
+    """
+    OpenRouter proxies 200+ models via an OpenAI-compatible API.
+    Models are referenced as "provider/model-name".
+    https://openrouter.ai/models
+    """
+    name = "OpenRouter"
+    base_url = "https://openrouter.ai/api/v1"
+    models = [
+        # OpenAI via OpenRouter
+        "openai/gpt-4o",
+        "openai/gpt-4o-mini",
+        "openai/gpt-4-turbo",
+        # Anthropic via OpenRouter
+        "anthropic/claude-3.5-sonnet",
+        "anthropic/claude-3-haiku",
+        "anthropic/claude-3-opus",
+        # Google via OpenRouter
+        "google/gemini-flash-1.5",
+        "google/gemini-pro-1.5",
+        # Meta / Llama (free tier)
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "meta-llama/llama-3.1-70b-instruct",
+        "meta-llama/llama-3.3-70b-instruct",
+        # Mistral
+        "mistralai/mistral-7b-instruct:free",
+        "mistralai/mistral-nemo",
+        "mistralai/mixtral-8x22b-instruct",
+        # DeepSeek
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-r1",
+        # Qwen
+        "qwen/qwen-2.5-72b-instruct",
+        # Others
+        "nvidia/llama-3.1-nemotron-70b-instruct",
+        "x-ai/grok-beta",
+    ]
+    default_model = "openai/gpt-4o-mini"
+
+
 SUPPORTED_PROVIDERS = {
     "openai": OpenAIProvider,
     "anthropic": AnthropicProvider,
     "gemini": GeminiProvider,
+    "openrouter": OpenRouterProvider,
 }
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-def get_llm_config() -> Tuple[str | None, str | None, str | None]:
-    """
-    Helper to get LLM configuration values, returns:
-        - api_key, model, provider
-    """
+
+def get_llm_config() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Returns (api_key, model, provider_key) from instance config / env."""
     api_key, provider_key, model = get_configuration_value(
         [
-            {
-                "key": "LLM_API_KEY",
-                "default": os.environ.get("LLM_API_KEY", None),
-            },
-            {
-                "key": "LLM_PROVIDER",
-                "default": os.environ.get("LLM_PROVIDER", "openai"),
-            },
-            {
-                "key": "LLM_MODEL",
-                "default": os.environ.get("LLM_MODEL", None),
-            },
+            {"key": "LLM_API_KEY", "default": os.environ.get("LLM_API_KEY", None)},
+            {"key": "LLM_PROVIDER", "default": os.environ.get("LLM_PROVIDER", "openai")},
+            {"key": "LLM_MODEL", "default": os.environ.get("LLM_MODEL", None)},
         ]
     )
 
-    provider = SUPPORTED_PROVIDERS.get(provider_key.lower())
+    provider = SUPPORTED_PROVIDERS.get((provider_key or "").lower())
     if not provider:
         log_exception(ValueError(f"Unsupported provider: {provider_key}"))
         return None, None, None
@@ -108,15 +140,15 @@ def get_llm_config() -> Tuple[str | None, str | None, str | None]:
         log_exception(ValueError(f"Missing API key for provider: {provider.name}"))
         return None, None, None
 
-    # If no model specified, use provider's default
     if not model:
         model = provider.default_model
 
-    # Validate model is supported by provider
-    if model not in provider.models:
+    # For strict providers (not OpenRouter) validate the model is in the list
+    if provider_key.lower() != "openrouter" and model not in provider.models:
         log_exception(
             ValueError(
-                f"Model {model} not supported by {provider.name}. Supported models: {', '.join(provider.models)}"
+                f"Model {model} not supported by {provider.name}. "
+                f"Supported models: {', '.join(provider.models)}"
             )
         )
         return None, None, None
@@ -124,20 +156,58 @@ def get_llm_config() -> Tuple[str | None, str | None, str | None]:
     return api_key, model, provider_key
 
 
-def get_llm_response(task, prompt, api_key: str, model: str, provider: str) -> Tuple[str | None, str | None]:
-    """Helper to get LLM completion response"""
-    final_text = task + "\n" + prompt
+def get_llm_response(
+    system_prompt: str,
+    user_prompt: str,
+    api_key: str,
+    model: str,
+    provider: str,
+    base_url: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Call the LLM and return (text, error).
+    Accepts an explicit base_url override (used for OpenRouter and per-request
+    provider overrides from the chatbot).
+    """
     try:
-        # For Gemini, prepend provider name to model
-        if provider.lower() == "gemini":
+        # Resolve base URL:
+        # 1. explicit override wins
+        # 2. then provider-level base_url
+        # 3. then Gemini prefix trick
+        resolved_base_url = base_url
+
+        provider_lower = (provider or "").lower()
+
+        if not resolved_base_url:
+            provider_cls = SUPPORTED_PROVIDERS.get(provider_lower)
+            if provider_cls:
+                resolved_base_url = provider_cls.base_url
+
+        if provider_lower == "gemini" and not resolved_base_url:
             model = f"gemini/{model}"
 
-        client = OpenAI(api_key=api_key)
+        client_kwargs = {"api_key": api_key}
+        if resolved_base_url:
+            client_kwargs["base_url"] = resolved_base_url
+
+        extra_headers = {}
+        if provider_lower == "openrouter" or resolved_base_url == OPENROUTER_BASE_URL:
+            extra_headers = {
+                "HTTP-Referer": "https://plane.so",
+                "X-Title": "Plane AI Task Reporter",
+            }
+
+        client = OpenAI(**client_kwargs)
         chat_completion = client.chat.completions.create(
-            model=model, messages=[{"role": "user", "content": final_text}]
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            extra_headers=extra_headers or None,
         )
-        text = chat_completion.choices[0].message.content
-        return text, None
+        return chat_completion.choices[0].message.content, None
+
     except Exception as e:
         log_exception(e)
         error_type = e.__class__.__name__
@@ -164,7 +234,7 @@ class GPTIntegrationEndpoint(BaseAPIView):
         if not task:
             return Response({"error": "Task is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        text, error = get_llm_response(task, request.data.get("prompt", False), api_key, model, provider)
+        text, error = get_llm_response(task, request.data.get("prompt", False) or "", api_key, model, provider)
         if not text and error:
             return Response(
                 {"error": "An internal error has occurred."},
@@ -177,7 +247,7 @@ class GPTIntegrationEndpoint(BaseAPIView):
         return Response(
             {
                 "response": text,
-                "response_html": text.replace("\n", "<br/>"),
+                "response_html": (text or "").replace("\n", "<br/>"),
                 "project_detail": ProjectLiteSerializer(project).data,
                 "workspace_detail": WorkspaceLiteSerializer(workspace).data,
             },
@@ -200,7 +270,7 @@ class WorkspaceGPTIntegrationEndpoint(BaseAPIView):
         if not task:
             return Response({"error": "Task is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        text, error = get_llm_response(task, request.data.get("prompt", False), api_key, model, provider)
+        text, error = get_llm_response(task, request.data.get("prompt", False) or "", api_key, model, provider)
         if not text and error:
             return Response(
                 {"error": "An internal error has occurred."},
@@ -210,7 +280,7 @@ class WorkspaceGPTIntegrationEndpoint(BaseAPIView):
         return Response(
             {
                 "response": text,
-                "response_html": text.replace("\n", "<br/>"),
+                "response_html": (text or "").replace("\n", "<br/>"),
             },
             status=status.HTTP_200_OK,
         )
@@ -226,11 +296,9 @@ class UnsplashEndpoint(BaseAPIView):
                 }
             ]
         )
-        # Check unsplash access key
         if not UNSPLASH_ACCESS_KEY:
             return Response([], status=status.HTTP_200_OK)
 
-        # Query parameters
         query = request.GET.get("query", False)
         page = request.GET.get("page", 1)
         per_page = request.GET.get("per_page", 20)
@@ -242,22 +310,55 @@ class UnsplashEndpoint(BaseAPIView):
         )
 
         headers = {"Content-Type": "application/json"}
-
         resp = requests.get(url=url, headers=headers)
         return Response(resp.json(), status=resp.status_code)
+
+
+class OpenRouterModelsEndpoint(BaseAPIView):
+    """Returns the list of models available in OpenRouter for the chatbot selector."""
+
+    @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    def get(self, request, slug):
+        return Response(
+            {
+                "provider": "openrouter",
+                "models": OpenRouterProvider.models,
+                "default_model": OpenRouterProvider.default_model,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class WorkspaceAITaskReportEndpoint(BaseAPIView):
     @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
     def post(self, request, slug):
-        api_key, model, provider = get_llm_config()
+        # --- Resolve provider/model (request can override instance defaults) ---
+        req_provider = (request.data.get("provider") or "").strip().lower()
+        req_model = (request.data.get("model") or "").strip()
+        req_api_key = (request.data.get("api_key") or "").strip()
+
+        if req_provider and req_provider == "openrouter" and req_model and req_api_key:
+            # Caller supplied full OpenRouter credentials — use them directly
+            api_key = req_api_key
+            model = req_model
+            provider = "openrouter"
+        else:
+            api_key, model, provider = get_llm_config()
+
+            # If caller asked for a specific OpenRouter model but key comes from config
+            if req_provider == "openrouter" and req_model:
+                model = req_model
+                provider = "openrouter"
+                if req_api_key:
+                    api_key = req_api_key
 
         if not api_key or not model or not provider:
             return Response(
-                {"error": "LLM provider API key and model are required"},
+                {"error": "LLM provider API key and model are required. Configure them in Settings → AI."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # --- Validate request ---
         question = request.data.get("question", "").strip()
         if not question:
             return Response({"error": "Question is required"}, status=status.HTTP_400_BAD_REQUEST)
@@ -266,7 +367,6 @@ class WorkspaceAITaskReportEndpoint(BaseAPIView):
         end_date_str = request.data.get("end_date")
         project_id = request.data.get("project_id")
 
-        # Parse or default date range
         try:
             if start_date_str:
                 start_date = datetime.fromisoformat(start_date_str).replace(tzinfo=dt_timezone.utc)
@@ -280,7 +380,7 @@ class WorkspaceAITaskReportEndpoint(BaseAPIView):
         except (ValueError, TypeError):
             return Response({"error": "Invalid date format. Use ISO 8601."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Build issue queryset for workspace, filtering by state group "completed" and date range
+        # --- Fetch completed issues ---
         issue_qs = (
             Issue.issue_objects.filter(
                 workspace__slug=slug,
@@ -295,43 +395,58 @@ class WorkspaceAITaskReportEndpoint(BaseAPIView):
         if project_id:
             issue_qs = issue_qs.filter(project_id=project_id)
 
-        # Cap at 200 issues to avoid huge prompts
         issue_qs = issue_qs.order_by("-completed_at")[:200]
 
-        # Serialize issues into a compact format for the LLM
+        # --- Serialize issues — include description content so the AI can read
+        #     blog URLs, notes, links, and any text the team put in the task body ---
         issues_data = []
         for issue in issue_qs:
-            assignee_names = [
-                f"{a.display_name or a.email}" for a in issue.assignees.all()
-            ]
+            assignee_names = [a.display_name or a.email for a in issue.assignees.all()]
             label_names = [label.name for label in issue.labels.all()]
-            issues_data.append(
-                {
-                    "id": str(issue.sequence_id),
-                    "title": issue.name,
-                    "project": issue.project.name if issue.project else "Unknown",
-                    "priority": issue.priority or "none",
-                    "assignees": assignee_names,
-                    "labels": label_names,
-                    "completed_at": issue.completed_at.strftime("%Y-%m-%d %H:%M UTC") if issue.completed_at else None,
-                }
-            )
+
+            # description_stripped is plain-text (HTML tags removed). Truncate to
+            # 1000 chars per issue so the prompt doesn't exceed token limits.
+            body = (issue.description_stripped or "").strip()
+            if len(body) > 1000:
+                body = body[:1000] + "…"
+
+            entry: Dict = {
+                "id": str(issue.sequence_id),
+                "title": issue.name,
+                "project": issue.project.name if issue.project else "Unknown",
+                "priority": issue.priority or "none",
+                "assignees": assignee_names,
+                "labels": label_names,
+                "completed_at": (
+                    issue.completed_at.strftime("%Y-%m-%d %H:%M UTC")
+                    if issue.completed_at
+                    else None
+                ),
+            }
+            if body:
+                entry["description"] = body
+
+            issues_data.append(entry)
 
         issues_json = json.dumps(issues_data, ensure_ascii=False, indent=2)
 
         system_prompt = (
-            "You are an AI assistant integrated into Plane, a project management tool. "
-            "Your job is to analyze completed work items and generate clear, helpful reports. "
-            "Use markdown formatting in your responses — headings, bullet lists, bold text, tables where appropriate. "
-            "Be concise but thorough. Group items logically (by project, priority, label, or date as appropriate). "
-            "If there are no items, say so clearly."
+            "You are an AI assistant integrated into Plane, a project management tool.\n"
+            "Your job is to analyze completed work items and generate clear, helpful reports.\n"
+            "Each work item may have a 'description' field containing the full task body — "
+            "this often includes URLs, blog links, notes, deliverables, and references.\n"
+            "When the user asks for URLs or links, extract them directly from the description fields.\n"
+            "Use markdown formatting — headings, bullet lists, bold text, tables where appropriate.\n"
+            "Be concise but thorough. Group items logically by project, priority, label, or date as needed.\n"
+            "If there are no matching items, say so clearly and suggest adjusting the date range."
         )
 
         user_prompt = (
-            f"The user asked: \"{question}\"\n\n"
-            f"Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n\n"
-            f"Here are the completed work items in that period (JSON):\n{issues_json}\n\n"
-            "Generate a well-formatted report answering the user's question based on these items."
+            f"User's question: \"{question}\"\n\n"
+            f"Date range searched: {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}\n\n"
+            f"Completed work items (JSON):\n{issues_json}\n\n"
+            "Generate a well-formatted report answering the user's question. "
+            "Extract URLs and specific content from task descriptions where relevant."
         )
 
         text, error = get_llm_response(system_prompt, user_prompt, api_key, model, provider)
@@ -348,6 +463,8 @@ class WorkspaceAITaskReportEndpoint(BaseAPIView):
                 "issue_count": len(issues_data),
                 "start_date": start_date.strftime("%Y-%m-%d"),
                 "end_date": end_date.strftime("%Y-%m-%d"),
+                "provider": provider,
+                "model": model,
             },
             status=status.HTTP_200_OK,
         )

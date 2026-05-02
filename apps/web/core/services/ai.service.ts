@@ -27,6 +27,10 @@ export type TTaskReportPayload = {
   start_date?: string;
   end_date?: string;
   project_id?: string;
+  /** OpenRouter override — if set, the backend uses this provider instead of instance default */
+  provider?: string;
+  model?: string;
+  api_key?: string;
 };
 
 export type TTaskReportResponse = {
@@ -34,6 +38,14 @@ export type TTaskReportResponse = {
   issue_count: number;
   start_date: string;
   end_date: string;
+  provider?: string;
+  model?: string;
+};
+
+export type TOpenRouterModelsResponse = {
+  provider: string;
+  models: string[];
+  default_model: string;
 };
 
 export class AIService extends APIService {
@@ -64,6 +76,14 @@ export class AIService extends APIService {
 
   async getTaskReport(workspaceSlug: string, data: TTaskReportPayload): Promise<TTaskReportResponse> {
     return this.post(`/api/workspaces/${workspaceSlug}/ai-task-report/`, data)
+      .then((res) => res?.data)
+      .catch((error) => {
+        throw error?.response;
+      });
+  }
+
+  async getOpenRouterModels(workspaceSlug: string): Promise<TOpenRouterModelsResponse> {
+    return this.get(`/api/workspaces/${workspaceSlug}/openrouter-models/`)
       .then((res) => res?.data)
       .catch((error) => {
         throw error?.response;

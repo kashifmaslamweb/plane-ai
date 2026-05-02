@@ -181,6 +181,7 @@ from .search.issue import IssueSearchEndpoint
 
 from .external.base import (
     GPTIntegrationEndpoint,
+    OpenRouterModelsEndpoint,
     UnsplashEndpoint,
     WorkspaceAITaskReportEndpoint,
     WorkspaceGPTIntegrationEndpoint,

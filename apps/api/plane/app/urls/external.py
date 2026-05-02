@@ -6,7 +6,12 @@ from django.urls import path
 
 
 from plane.app.views import UnsplashEndpoint
-from plane.app.views import GPTIntegrationEndpoint, WorkspaceGPTIntegrationEndpoint, WorkspaceAITaskReportEndpoint
+from plane.app.views import (
+    GPTIntegrationEndpoint,
+    OpenRouterModelsEndpoint,
+    WorkspaceGPTIntegrationEndpoint,
+    WorkspaceAITaskReportEndpoint,
+)
 
 
 urlpatterns = [
@@ -25,5 +30,10 @@ urlpatterns = [
         "workspaces/<str:slug>/ai-task-report/",
         WorkspaceAITaskReportEndpoint.as_view(),
         name="workspace-ai-task-report",
+    ),
+    path(
+        "workspaces/<str:slug>/openrouter-models/",
+        OpenRouterModelsEndpoint.as_view(),
+        name="workspace-openrouter-models",
     ),
 ]
