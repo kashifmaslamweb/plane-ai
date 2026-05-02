@@ -8,6 +8,7 @@ import React from "react";
 import { observer } from "mobx-react";
 // plane imports
 import { cn } from "@plane/utils";
+import { AIChatBot } from "@/components/ai-chatbot";
 import { AppRailRoot } from "@/components/navigation";
 import { useAppRailVisibility } from "@/lib/app-rail";
 // local imports
@@ -38,6 +39,7 @@ export const WorkspaceContentWrapper = observer(function WorkspaceContentWrapper
           {children}
         </div>
       </div>
+      <AIChatBot />
     </div>
   );
 });

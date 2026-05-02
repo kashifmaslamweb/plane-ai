@@ -22,6 +22,20 @@ export type TTaskPayload = {
   text_input: string;
 };
 
+export type TTaskReportPayload = {
+  question: string;
+  start_date?: string;
+  end_date?: string;
+  project_id?: string;
+};
+
+export type TTaskReportResponse = {
+  response: string;
+  issue_count: number;
+  start_date: string;
+  end_date: string;
+};
+
 export class AIService extends APIService {
   constructor() {
     super(API_BASE_URL);
@@ -45,6 +59,14 @@ export class AIService extends APIService {
       .then((res) => res?.data)
       .catch((error) => {
         throw error?.response?.data;
+      });
+  }
+
+  async getTaskReport(workspaceSlug: string, data: TTaskReportPayload): Promise<TTaskReportResponse> {
+    return this.post(`/api/workspaces/${workspaceSlug}/ai-task-report/`, data)
+      .then((res) => res?.data)
+      .catch((error) => {
+        throw error?.response;
       });
   }
 }

@@ -4,11 +4,15 @@
 
 # Python import
 import os
+import json
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import List, Dict, Tuple
 
 # Third party import
 from openai import OpenAI
 import requests
+
+from django.utils import timezone
 
 from rest_framework import status
 from rest_framework.response import Response
@@ -16,7 +20,7 @@ from rest_framework.response import Response
 # Module import
 from plane.app.permissions import ROLE, allow_permission
 from plane.app.serializers import ProjectLiteSerializer, WorkspaceLiteSerializer
-from plane.db.models import Project, Workspace
+from plane.db.models import Issue, Label, Project, Workspace
 from plane.license.utils.instance_value import get_configuration_value
 from plane.utils.exception_logger import log_exception
 
@@ -241,3 +245,109 @@ class UnsplashEndpoint(BaseAPIView):
 
         resp = requests.get(url=url, headers=headers)
         return Response(resp.json(), status=resp.status_code)
+
+
+class WorkspaceAITaskReportEndpoint(BaseAPIView):
+    @allow_permission(allowed_roles=[ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST], level="WORKSPACE")
+    def post(self, request, slug):
+        api_key, model, provider = get_llm_config()
+
+        if not api_key or not model or not provider:
+            return Response(
+                {"error": "LLM provider API key and model are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        question = request.data.get("question", "").strip()
+        if not question:
+            return Response({"error": "Question is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        start_date_str = request.data.get("start_date")
+        end_date_str = request.data.get("end_date")
+        project_id = request.data.get("project_id")
+
+        # Parse or default date range
+        try:
+            if start_date_str:
+                start_date = datetime.fromisoformat(start_date_str).replace(tzinfo=dt_timezone.utc)
+            else:
+                start_date = timezone.now() - timedelta(days=7)
+
+            if end_date_str:
+                end_date = datetime.fromisoformat(end_date_str).replace(tzinfo=dt_timezone.utc)
+            else:
+                end_date = timezone.now()
+        except (ValueError, TypeError):
+            return Response({"error": "Invalid date format. Use ISO 8601."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Build issue queryset for workspace, filtering by state group "completed" and date range
+        issue_qs = (
+            Issue.issue_objects.filter(
+                workspace__slug=slug,
+                state__group="completed",
+                completed_at__gte=start_date,
+                completed_at__lte=end_date,
+            )
+            .select_related("project", "state", "created_by")
+            .prefetch_related("assignees", "labels")
+        )
+
+        if project_id:
+            issue_qs = issue_qs.filter(project_id=project_id)
+
+        # Cap at 200 issues to avoid huge prompts
+        issue_qs = issue_qs.order_by("-completed_at")[:200]
+
+        # Serialize issues into a compact format for the LLM
+        issues_data = []
+        for issue in issue_qs:
+            assignee_names = [
+                f"{a.display_name or a.email}" for a in issue.assignees.all()
+            ]
+            label_names = [label.name for label in issue.labels.all()]
+            issues_data.append(
+                {
+                    "id": str(issue.sequence_id),
+                    "title": issue.name,
+                    "project": issue.project.name if issue.project else "Unknown",
+                    "priority": issue.priority or "none",
+                    "assignees": assignee_names,
+                    "labels": label_names,
+                    "completed_at": issue.completed_at.strftime("%Y-%m-%d %H:%M UTC") if issue.completed_at else None,
+                }
+            )
+
+        issues_json = json.dumps(issues_data, ensure_ascii=False, indent=2)
+
+        system_prompt = (
+            "You are an AI assistant integrated into Plane, a project management tool. "
+            "Your job is to analyze completed work items and generate clear, helpful reports. "
+            "Use markdown formatting in your responses — headings, bullet lists, bold text, tables where appropriate. "
+            "Be concise but thorough. Group items logically (by project, priority, label, or date as appropriate). "
+            "If there are no items, say so clearly."
+        )
+
+        user_prompt = (
+            f"The user asked: \"{question}\"\n\n"
+            f"Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n\n"
+            f"Here are the completed work items in that period (JSON):\n{issues_json}\n\n"
+            "Generate a well-formatted report answering the user's question based on these items."
+        )
+
+        text, error = get_llm_response(system_prompt, user_prompt, api_key, model, provider)
+
+        if not text and error:
+            return Response(
+                {"error": error or "An internal error has occurred."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return Response(
+            {
+                "response": text,
+                "issue_count": len(issues_data),
+                "start_date": start_date.strftime("%Y-%m-%d"),
+                "end_date": end_date.strftime("%Y-%m-%d"),
+            },
+            status=status.HTTP_200_OK,
+        )

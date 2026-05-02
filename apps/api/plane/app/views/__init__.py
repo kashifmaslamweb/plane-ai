@@ -182,6 +182,7 @@ from .search.issue import IssueSearchEndpoint
 from .external.base import (
     GPTIntegrationEndpoint,
     UnsplashEndpoint,
+    WorkspaceAITaskReportEndpoint,
     WorkspaceGPTIntegrationEndpoint,
 )
 from .estimate.base import (
